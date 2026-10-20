@@ -40,22 +40,30 @@ final class SleepBlocker {
 enum ClaudeDetector {
     /// Claude Code CLI(`claude`)가 실행 중인지 확인한다.
     static func isRunning() -> Bool {
+        // comm 은 실행 파일 전체 경로를 공백까지 그대로 준다.
+        // 데스크톱 앱이 띄우는 claude 는 "Application Support" 아래에 있어 args 를 공백으로 자르면 놓친다.
+        let programs = psLines("comm=")
+        if programs.contains(where: { basename(Substring($0)) == "claude" }) { return true }
+        return psLines("args=").contains { isClaude($0) }
+    }
+
+    private static func psLines(_ format: String) -> [String] {
         let ps = Process()
         ps.executableURL = URL(fileURLWithPath: "/bin/ps")
-        ps.arguments = ["-axww", "-o", "args="]
+        ps.arguments = ["-axww", "-o", format]
         let pipe = Pipe()
         ps.standardOutput = pipe
         ps.standardError = FileHandle.nullDevice
         do {
             try ps.run()
         } catch {
-            return false
+            return []
         }
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         ps.waitUntilExit()
 
         let output = String(decoding: data, as: UTF8.self)
-        return output.split(separator: "\n").contains { isClaude(String($0)) }
+        return output.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }
     }
 
     /// 네이티브 설치(`claude ...`)와 npm 설치(`node .../claude ...`)를 모두 잡는다.
