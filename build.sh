@@ -20,6 +20,7 @@ echo "빌드 완료: $APP"
 
 if [[ "${1:-}" == "install" ]]; then
   pkill -x Awakening 2>/dev/null || true
+  sleep 1  # 바로 open 하면 종료 중인 앱과 겹쳐 -600 오류가 난다
   rm -rf /Applications/Awakening.app
   cp -R "$APP" /Applications/
   open /Applications/Awakening.app

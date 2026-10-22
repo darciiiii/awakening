@@ -85,6 +85,60 @@ enum ClaudeDetector {
     }
 }
 
+// MARK: - 로그인 감시
+
+/// 원격 작업이 끊기는 주원인인 로그인 만료를 감시한다.
+/// - CLI 로그인: `claude auth status --text` 에 "Login:" 줄(만료 등)이 나오거나 로그인이 없으면 문제.
+/// - 데스크톱 앱 로그인: 앱 로그의 마지막 기록이 session_stale_relogin 실패면 문제.
+enum LoginWatcher {
+    static func problems() -> [String] {
+        var found: [String] = []
+        if let cli = cliProblem() { found.append(cli) }
+        if desktopNeedsRelogin() { found.append("데스크톱 앱 로그인 만료 — Claude 앱에서 다시 로그인") }
+        return found
+    }
+
+    private static func cliProblem() -> String? {
+        let home = NSHomeDirectory()
+        let claude = home + "/.local/bin/claude"
+        guard FileManager.default.isExecutableFile(atPath: claude) else { return nil }
+
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: claude)
+        p.arguments = ["auth", "status", "--text"]
+        p.environment = ["HOME": home, "USER": NSUserName(), "PATH": "/usr/bin:/bin", "LANG": "en_US.UTF-8"]
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = pipe
+        do { try p.run() } catch { return nil }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+
+        let out = String(decoding: data, as: UTF8.self)
+        if out.contains("Not logged in") || out.contains("Login:") {
+            return "CLI 로그인 만료 — 터미널에서 claude auth login"
+        }
+        return nil
+    }
+
+    private static func desktopNeedsRelogin() -> Bool {
+        let path = NSHomeDirectory() + "/Library/Logs/Claude/main.log"
+        guard let handle = FileHandle(forReadingAtPath: path) else { return false }
+        defer { try? handle.close() }
+        let size = (try? handle.seekToEnd()) ?? 0
+        try? handle.seek(toOffset: size > 2_000_000 ? size - 2_000_000 : 0)
+        let tail = String(decoding: handle.readDataToEndOfFile(), as: UTF8.self)
+
+        // 다시 로그인하면 앱이 "clearing latched session_stale_relogin" 을 남긴다.
+        guard let failed = tail.range(of: "session_stale_relogin", options: .backwards) else { return false }
+        if let cleared = tail.range(of: "clearing latched session_stale_relogin", options: .backwards),
+           cleared.lowerBound >= tail.lineRange(for: failed).lowerBound {
+            return false
+        }
+        return true
+    }
+}
+
 // MARK: - 메뉴바 앱
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -101,6 +155,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let statusLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     private let manualItem = NSMenuItem(title: "수동으로 깨어있기", action: #selector(toggleManual), keyEquivalent: "")
     private let autoItem = NSMenuItem(title: "claude 실행 중일 때 자동 유지", action: #selector(toggleAuto), keyEquivalent: "")
+
+    private let loginLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+    private var loginTimer: Timer?
+    private var loginProblems: [String] = []
 
     private var claudeRunning = false
 
@@ -123,7 +181,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusLine.isEnabled = false
         manualItem.target = self
         autoItem.target = self
+        loginLine.isEnabled = false
         menu.addItem(statusLine)
+        menu.addItem(loginLine)
         menu.addItem(.separator())
         menu.addItem(manualItem)
         menu.addItem(autoItem)
@@ -133,6 +193,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         timer = Timer.scheduledTimer(timeInterval: 5, target: self, selector: #selector(poll), userInfo: nil, repeats: true)
         poll()
+
+        // 로그인 확인은 claude 를 띄우므로 10분마다만 한다.
+        loginTimer = Timer.scheduledTimer(timeInterval: 600, target: self, selector: #selector(checkLogin), userInfo: nil, repeats: true)
+        checkLogin()
+    }
+
+    @objc private func checkLogin() {
+        DispatchQueue.global(qos: .utility).async {
+            let problems = LoginWatcher.problems()
+            DispatchQueue.main.async {
+                let newOnes = problems.filter { !self.loginProblems.contains($0) }
+                self.loginProblems = problems
+                if !newOnes.isEmpty { self.alert(newOnes) }
+                self.apply()
+            }
+        }
+    }
+
+    /// 새로 생긴 로그인 문제를 알림 센터에 띄운다(실행 권한 없이 쓰려고 osascript 사용).
+    private func alert(_ problems: [String]) {
+        let text = problems.joined(separator: " / ").replacingOccurrences(of: "\"", with: "'")
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        p.arguments = ["-e", "display notification \"\(text)\" with title \"Awakening: 원격 작업이 끊길 수 있음\" sound name \"Basso\""]
+        try? p.run()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -171,7 +256,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             statusLine.title = "휴면 허용"
         }
 
-        let symbol = blocker.isActive ? "sun.max.fill" : "moon.zzz"
+        if loginProblems.isEmpty {
+            loginLine.title = "로그인 정상"
+        } else {
+            loginLine.title = "⚠ " + loginProblems.joined(separator: "\n⚠ ")
+        }
+
+        let symbol = !loginProblems.isEmpty ? "exclamationmark.triangle.fill"
+            : blocker.isActive ? "sun.max.fill" : "moon.zzz"
         let image = NSImage(systemSymbolName: symbol, accessibilityDescription: statusLine.title)
         image?.isTemplate = true
         statusItem.button?.image = image
